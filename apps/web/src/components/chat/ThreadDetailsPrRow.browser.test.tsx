@@ -1,5 +1,6 @@
 import { EnvironmentId, ProjectId, ThreadId, type PullRequestCheck } from "@t3tools/contracts";
-import { DraftId } from "~/composerDraftStore";
+import { DraftId, useComposerDraftStore } from "~/composerDraftStore";
+import { userEvent } from "vite-plus/test/browser";
 import { AsyncResult } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 
@@ -13,10 +14,26 @@ const state = vi.hoisted(() => ({
   checkoutError: null as Error | null,
   addToast: vi.fn(),
   updateToast: vi.fn(),
+  startTurn: vi.fn(),
+  canOperate: true,
+  branch: "feature" as string | null,
+  projectId: "project",
+  hasThread: true,
+  conflicting: false,
 }));
 
 vi.mock(import("~/state/entities"), async (importOriginal) => ({
   ...(await importOriginal()),
+  useQuietThreadShell: (() =>
+    state.hasThread
+      ? {
+          id: ThreadId.make("current-thread"),
+          projectId: ProjectId.make(state.projectId),
+          branch: state.branch,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        }
+      : null) as never,
   // Rows render a pull request only with a project, so this does not reach tests that pass none.
   useServerConfigs: (() =>
     new Map([
@@ -34,7 +51,7 @@ const queryData = () => ({
   title: "Test PR",
   state: "open",
   isDraft: false,
-  mergeability: "mergeable",
+  mergeability: state.conflicting ? "conflicting" : "mergeable",
   headBranch: "feature",
   baseBranch: "main",
   changedFiles: 1,
@@ -75,6 +92,13 @@ vi.mock(import("../pullRequest/usePullRequestActions"), async (importOriginal) =
   ...(await importOriginal()),
   usePullRequestActionRunner: () => ({ actionPending: false, perform: state.perform }),
 }));
+vi.mock(import("~/state/use-orchestration-command"), () => ({
+  useOrchestrationCommand: (() => state.startTurn) as never,
+}));
+vi.mock(import("~/state/session"), async (original) => ({
+  ...(await original()),
+  useEnvironmentScope: () => state.canOperate,
+}));
 
 vi.mock(import("~/hooks/useHandleNewThread"), async (original) => ({
   ...(await original()),
@@ -104,6 +128,11 @@ import { act, render as renderUi } from "../../../test/render";
 import { useUiStateStore } from "~/uiStateStore";
 import { ThreadDetailsPrRow } from "./ThreadDetailsPrRow";
 
+const threadRef = {
+  environmentId: EnvironmentId.make("environment"),
+  threadId: ThreadId.make("current-thread"),
+};
+
 it("merges with the last selected merge method", async () => {
   await using screen = await setup();
   const { container } = screen;
@@ -112,6 +141,7 @@ it("merges with the last selected merge method", async () => {
   await act(async () => {
     await screen.rerender(
       <ThreadDetailsPrRow
+        threadRef={threadRef}
         environmentId={EnvironmentId.make("environment")}
         pr={null}
         number={1}
@@ -141,6 +171,7 @@ it("requires a new merge click after passing checks become pending and pass agai
   const { container } = screen;
   const render = () => (
     <ThreadDetailsPrRow
+      threadRef={threadRef}
       environmentId={EnvironmentId.make("environment")}
       pr={null}
       number={1}
@@ -184,9 +215,18 @@ async function setup() {
     draftId: DraftId.make("new-draft"),
     threadId: ThreadId.make("new-thread"),
   });
-  state.prepareThread.mockReset();
+  state.prepareThread.mockReset().mockResolvedValue({
+    _tag: "Success",
+    value: { branch: "feature", worktreePath: "/workspace/feature", isOnPullRequestHead: true },
+  });
   state.addToast.mockReset().mockReturnValue("checkout-toast");
   state.updateToast.mockReset();
+  state.startTurn.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
+  state.canOperate = true;
+  state.branch = "feature";
+  state.projectId = "project";
+  state.hasThread = true;
+  state.conflicting = false;
 
   state.status = "success";
   state.extraStatus = null;
@@ -194,3 +234,110 @@ async function setup() {
   useUiStateStore.getState().setPullRequestMergeMethod("merge");
   return renderUi(null);
 }
+
+function RepairRow() {
+  return (
+    <ThreadDetailsPrRow
+      threadRef={threadRef}
+      environmentId={threadRef.environmentId}
+      pr={null}
+      number={1}
+      status={null}
+      project={null}
+      label="Test PR"
+      openAriaLabel="Open PR"
+      onOpen={vi.fn()}
+    />
+  );
+}
+
+it.each(["Fix", "Resolve"])(
+  "sends %s to the existing thread without consuming its draft",
+  async (label) => {
+    await using screen = await setup();
+    state.status = "failure";
+    state.conflicting = label === "Resolve";
+    const drafts = useComposerDraftStore.getState();
+    drafts.setPrompt(threadRef, "My unfinished message");
+    await screen.rerender(<RepairRow />);
+
+    await userEvent.click(screen.getByRole("button", { name: label, exact: true }));
+
+    expect(state.startTurn).toHaveBeenCalledTimes(1);
+    expect(state.startTurn).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        message: {
+          messageId: expect.any(String),
+          role: "user",
+          text: expect.stringContaining("https://github.com/owner/repo/pull/1"),
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        dispatchMode: "queue",
+      },
+    });
+    expect(state.startTurn.mock.calls[0]![0].input.message.text).toContain(
+      label === "Fix" ? "CI-failure" : "main",
+    );
+    expect(drafts.getComposerDraft(threadRef)?.prompt).toBe("My unfinished message");
+    expect(state.newThread).not.toHaveBeenCalled();
+    expect(state.prepareThread).not.toHaveBeenCalled();
+  },
+);
+
+it.each(["permission", "draft", "project", "branch", "environment"])(
+  "does not send a repair task with a mismatched %s",
+  async (reason) => {
+    await using screen = await setup();
+    state.status = "failure";
+    if (reason === "permission") state.canOperate = false;
+    if (reason === "draft") state.hasThread = false;
+    if (reason === "project") state.projectId = "another-project";
+    if (reason === "branch") state.branch = "main";
+    await screen.rerender(
+      <ThreadDetailsPrRow
+        threadRef={
+          reason === "environment"
+            ? { ...threadRef, environmentId: EnvironmentId.make("another-environment") }
+            : threadRef
+        }
+        environmentId={threadRef.environmentId}
+        pr={null}
+        number={1}
+        status={null}
+        project={null}
+        label="Test PR"
+        openAriaLabel="Open PR"
+        onOpen={vi.fn()}
+      />,
+    );
+    await expect.element(screen.getByRole("button", { name: "Fix", exact: true })).toBeDisabled();
+    expect(state.startTurn).not.toHaveBeenCalled();
+  },
+);
+
+it("prevents duplicate submissions and permits retry after a failed send", async () => {
+  await using screen = await setup();
+  state.status = "failure";
+  let finish!: (result: { _tag: "Failure" }) => void;
+  const pending = new Promise<{ _tag: "Failure" }>((resolve) => {
+    finish = resolve;
+  });
+  state.startTurn.mockReturnValueOnce(pending);
+  await screen.rerender(<RepairRow />);
+  const button = screen.getByRole("button", { name: "Fix", exact: true });
+  await userEvent.click(button);
+  await expect.element(screen.getByRole("button", { name: "Sending..." })).toBeDisabled();
+  expect(state.startTurn).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    finish({ _tag: "Failure" });
+    await pending;
+  });
+  await expect.element(button).toBeEnabled();
+  expect(state.addToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: "success" }));
+  await userEvent.click(button);
+  expect(state.startTurn).toHaveBeenCalledTimes(2);
+});

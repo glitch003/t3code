@@ -8,22 +8,25 @@ import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { selectEnvironmentQueryData } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
-import type { EnvironmentId, ProjectId, PullRequestRef } from "@t3tools/contracts";
 import {
-  ArrowUpRightIcon,
-  EyeIcon,
-  EyeOffIcon,
-  FileDiffIcon,
-  GitBranchIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+  AuthOrchestrationOperateScope,
+  type EnvironmentId,
+  type ProjectId,
+  type PullRequestRef,
+  type ScopedThreadRef,
+} from "@t3tools/contracts";
+import { EyeIcon, EyeOffIcon, FileDiffIcon, GitBranchIcon, TriangleAlertIcon } from "lucide-react";
 import { AsyncResult } from "effect/reactivity";
-import { useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 
 import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { usePullRequestChecksRefresh } from "~/hooks/usePullRequestChecksRefresh";
-import { cn } from "~/lib/utils";
-import { useServerConfigs } from "~/state/entities";
+import { useStableCallback } from "~/hooks/useStableCallback";
+import { cn, newMessageId } from "~/lib/utils";
+import { useQuietThreadShell, useServerConfigs } from "~/state/entities";
+import { useEnvironmentScope } from "~/state/session";
+import { threadEnvironment } from "~/state/threads";
+import { useOrchestrationCommand } from "~/state/use-orchestration-command";
 import { pullRequestEnvironment } from "~/state/pullRequests";
 import { useUiStateStore } from "~/uiStateStore";
 import {
@@ -52,8 +55,8 @@ import {
 import {
   usePullRequestActionRunner,
   usePullRequestDefaultMergeMethodResolver,
-  usePullRequestHandoffs,
 } from "../pullRequest/usePullRequestActions";
+import { toastManager } from "../ui/toast";
 import {
   ChangeRequestStatusIcon,
   type PrStatusIndicator,
@@ -83,6 +86,7 @@ const isSettledWithoutChecks = (result: AsyncResult.AsyncResult<unknown, unknown
 
 export function ThreadDetailsPrRow({
   environmentId,
+  threadRef,
   pr,
   number,
   reference: linkedReference,
@@ -95,6 +99,7 @@ export function ThreadDetailsPrRow({
   onStopWatching,
 }: {
   environmentId: EnvironmentId;
+  threadRef: ScopedThreadRef;
   pr: ThreadPr;
   number: number;
   reference?: Pick<PullRequestRef, "host" | "repository" | "number"> | null;
@@ -167,7 +172,51 @@ export function ThreadDetailsPrRow({
       onActed?.();
     },
   });
-  const { handoff, startHandoff } = usePullRequestHandoffs({ environmentId, detail });
+  const thread = useQuietThreadShell(threadRef);
+  const canOperateThread = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+  const startTurn = useOrchestrationCommand(threadEnvironment.startTurn);
+  const sending = useRef(false);
+  const [handoff, setHandoff] = useState<string | null>(null);
+  const taskUnavailableReason = !canOperateThread
+    ? "This connection cannot send messages."
+    : thread === null
+      ? "Start this thread before sending a repair task."
+      : detail === null ||
+          threadRef.environmentId !== environmentId ||
+          thread.projectId !== detail.projectId
+        ? "Open this pull request in a thread for its project."
+        : thread.branch !== detail.headBranch
+          ? `Switch this thread to ${detail.headBranch} before sending a repair task.`
+          : null;
+  const sendTask = async (kind: string, prompt: string) => {
+    if (thread === null || taskUnavailableReason !== null || sending.current) return;
+    sending.current = true;
+    setHandoff(kind);
+    try {
+      const result = await startTurn({
+        environmentId: threadRef.environmentId,
+        input: {
+          threadId: threadRef.threadId,
+          message: { messageId: newMessageId(), role: "user", text: prompt, attachments: [] },
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
+          dispatchMode: "queue",
+        },
+      });
+      if (result._tag === "Success") {
+        toastManager.add({ type: "success", title: "Task sent to this thread" });
+      }
+    } catch (error) {
+      toastManager.add({
+        type: "error",
+        title: "Could not send the task",
+        description: error instanceof Error ? error.message : "Try again from this thread.",
+      });
+    }
+    sending.current = false;
+    setHandoff(null);
+  };
+  const sendTaskStable = useStableCallback(sendTask);
   const lastSelectedMergeMethod = useUiStateStore((state) => state.pullRequestMergeMethod);
   const resolveProjectDefaultMergeMethod = usePullRequestDefaultMergeMethodResolver(
     environmentId,
@@ -191,19 +240,20 @@ export function ThreadDetailsPrRow({
 
   const startResolveConflicts = () => {
     if (detail === null) return;
-    void startHandoff("conflicts", {
-      prompt: buildResolveConflictsPrompt({
+    void sendTaskStable(
+      "conflicts",
+      buildResolveConflictsPrompt({
         number: detail.number,
         url: detail.url,
         headBranch: detail.headBranch,
         baseBranch: detail.baseBranch,
       }),
-    });
+    );
   };
 
   const startFixChecks = () => {
     if (detail === null) return;
-    void startHandoff(
+    void sendTaskStable(
       "findings",
       buildFixFindingsHandoff({
         number: detail.number,
@@ -215,7 +265,7 @@ export function ThreadDetailsPrRow({
         comments: [],
         checks: detail.checks,
         commentsTruncated: false,
-      }),
+      }).prompt,
     );
   };
 
@@ -320,11 +370,11 @@ export function ThreadDetailsPrRow({
     rowAction === "resolve"
       ? {
           label: "Resolve",
-          pendingLabel: "Preparing...",
+          pendingLabel: "Sending...",
           pending: handoff === "conflicts",
           destructive: true,
-          suffix: <ArrowUpRightIcon aria-hidden className="size-3 shrink-0" />,
-          tooltip: "Check the branch out and resolve the conflicts in a new thread",
+          suffix: null,
+          tooltip: taskUnavailableReason ?? "Resolve the conflicts in this thread",
           onClick: startResolveConflicts,
         }
       : rowAction === "ready"
@@ -340,11 +390,11 @@ export function ThreadDetailsPrRow({
         : rowAction === "fix"
           ? {
               label: "Fix",
-              pendingLabel: "Preparing...",
+              pendingLabel: "Sending...",
               pending: handoff === "findings",
               destructive: true,
-              suffix: <ArrowUpRightIcon aria-hidden className="size-3 shrink-0" />,
-              tooltip: "Fix the failing checks in a new thread",
+              suffix: null,
+              tooltip: taskUnavailableReason ?? "Fix the failing checks in this thread",
               onClick: startFixChecks,
             }
           : rowAction === "merge"
@@ -459,7 +509,12 @@ export function ThreadDetailsPrRow({
                       size="sm"
                       part="meta"
                       tone={trailingAction.destructive ? "destructive" : "primary"}
-                      disabled={actionPending || handoff !== null}
+                      disabled={
+                        actionPending ||
+                        handoff !== null ||
+                        ((rowAction === "fix" || rowAction === "resolve") &&
+                          taskUnavailableReason !== null)
+                      }
                       onClick={trailingAction.onClick}
                     />
                   }
